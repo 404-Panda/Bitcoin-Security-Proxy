@@ -88,7 +88,7 @@ python3 --version
 pip install ntplib
 Quick Start
 bash# Clone the repository
-git clone https://github.com/your-repo/bitcoin-mining-proxy
+git clone https://github.com/404-Panda/Bitcoin-Security-Proxy
 cd bitcoin-mining-proxy
 
 # Run the proxy
@@ -171,35 +171,10 @@ Data: {
   "new_extranonce1": "cd92a771",
   "time_since_connect": 3847.2
 }
-geek_mode_analysis.txt
-Technical deep-dive logs for analysis.
-🔬 Technical Deep Dive
-Stratum Protocol Monitoring
-The proxy intercepts and analyzes all Stratum mining protocol messages:
-mining.subscribe - Monitors extranonce allocation
-pythondef handle_subscribe_fast(msg, sock, addr):
-    extranonce1 = result[1]
-    extranonce2_size = result[2]
-    # Analyze nonce space allocation
-    analyze_extranonce_allocation(extranonce1, extranonce2_size, addr)
-mining.notify - Job analysis with timing verification
-pythondef handle_notify_fast(msg):
-    job_data = extract_job_parameters(msg)
-    # Verify job timestamps against NTP time
-    analyze_job_timing(job_data, receive_time)
-mining.submit - Complete share verification
-pythondef handle_submit_fast(msg, sock, addr):
-    # Rebuild complete block header
-    header = construct_block_header(job_data, extranonce_data, submit_params)
-    header_hash = double_sha256(header)
-    
-    # Verify against target
-    is_block = analyze_share_submission(header_hash, target, job_data)
 Cryptographic Verification
 Block Header Reconstruction:
 Version (4 bytes) + PrevHash (32 bytes) + MerkleRoot (32 bytes) + 
 Timestamp (4 bytes) + Bits (4 bytes) + Nonce (4 bytes) = 80 bytes
-
 MerkleRoot = merkle_tree_root(coinbase_hash, merkle_branches)
 Coinbase = coinbase1 + extranonce1 + extranonce2 + coinbase2
 Share Difficulty Calculation:
@@ -246,30 +221,35 @@ Market pressure increases - Transparent pools gain competitive advantage
 Industry standards improve - Public monitoring creates accountability
 
 Goal: Make pool manipulation unprofitable through transparency.
+
 🚨 Known Attack Vectors
 1. Timing Attacks
 Description: Pool delays job delivery to reduce effective hashrate
 Detection: Job interval analysis, NTP timestamp verification
 Evidence: Consistent delays exceeding network latency
-2. Share Skimming
+
+3. Share Skimming
 Description: Pool claims near-miss shares or rejects valid shares
 Detection: Local hash verification, rejection rate analysis
 Evidence: Mathematically valid shares being rejected
-3. Extranonce Manipulation
+
+5. Extranonce Manipulation
 Description: Pool limits nonce space or changes extranonce1 mid-session
 Detection: Nonce space analysis, extranonce1 change monitoring
 Evidence: Insufficient search space or mid-session changes
-4. Block Withholding
+
+7. Block Withholding
 Description: Pool doesn't submit blocks found by specific miners
 Detection: Block detection with independent verification
 Evidence: Valid blocks not appearing on blockchain
-5. Vardiff Attacks
+
+9. Vardiff Attacks
 Description: Pool manipulates variable difficulty to reduce effective payouts
 Detection: Difficulty trend analysis, timing correlation
 Evidence: Artificial difficulty spikes correlated with miner performance
+
 📊 Statistical Analysis
 Rejection Rate Baselines
-
 Normal: <2% rejection rate
 Suspicious: 5-10% rejection rate
 Fraudulent: >10% rejection rate
@@ -285,20 +265,6 @@ Nonce Space Standards
 Generous: 8+ bytes extranonce2
 Adequate: 4-6 bytes extranonce2
 Limited: <4 bytes extranonce2 (potential manipulation)
-
-🤝 Contributing
-Development Setup
-bashgit clone https://github.com/your-repo/bitcoin-mining-proxy
-cd bitcoin-mining-proxy
-pip install -r requirements.txt
-python3 -m pytest tests/
-Adding New Detection Methods
-
-Implement detection function in appropriate module
-Add alerts to suspicious_activity tracking
-Include geek mode logging
-Add test coverage
-Update documentation
 
 Reporting Issues
 
@@ -321,18 +287,4 @@ Use responsibly. Verify claims with evidence. Support honest pools.
 MIT License - See LICENSE for details.
 🙏 Acknowledgments
 
-Bitcoin Core developers for the protocol foundation
-Stratum protocol designers
-Mining pool operators who operate transparently
-The broader Bitcoin mining community
-
-🔗 Resources
-
-Stratum Mining Protocol Specification
-Bitcoin Mining Pool Comparison
-NTP Protocol Reference
-Bitcoin Developer Documentation
-
-
-Remember: An informed miner is a protected miner. Knowledge is power. Transparency is accountability.
-🛡️ Protect yourself. Monitor your pool. Demand transparency.
+No one.. Because no one ever helps anyone.  Your on your own.. Deal with it.

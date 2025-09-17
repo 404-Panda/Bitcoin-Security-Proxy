@@ -56,6 +56,8 @@ job_templates = {}  # job_id -> job_data
 extranonce_registry = {}  # socket_id -> extranonce_info
 share_database = deque(maxlen=1000)  # Recent share analysis
 timing_database = deque(maxlen=500)  # Timing analysis data
+pending_shares = {}  # msg_id -> share_data for tracking responses
+pool_difficulty = {}  # miner_addr -> current pool difficulty
 miner_profiles = defaultdict(lambda: {
     'connect_time': time.time(),
     'total_shares': 0,
@@ -71,7 +73,11 @@ miner_profiles = defaultdict(lambda: {
     'timing_profile': deque(maxlen=100),
     'worker_name': 'unknown',
     'last_share_time': 0,
-    'avg_share_interval': 0
+    'avg_share_interval': 0,
+    'total_difficulty_submitted': 0,
+    'best_share_difficulty': 0,
+    'session_hash_rate': 0,
+    'current_pool_difficulty': 0  # Track pool-assigned difficulty
 })
 
 # Performance counters
@@ -88,7 +94,8 @@ perf_stats = {
     'near_misses': 0,
     'active_connections': 0,
     'timing_anomalies': 0,
-    'last_ntp_sync': 0
+    'last_ntp_sync': 0,
+    'total_difficulty_submitted': 0
 }
 
 # Suspicious activity tracking
@@ -99,6 +106,33 @@ fraud_detector = {
     'job_withholding': [],
     'share_skimming': []
 }
+
+# --------------- LOGGING FUNCTIONS ---------------
+def log_suspicious_event(event_type, description, data=None, severity='MEDIUM'):
+    """Log suspicious events to file with detailed information"""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    event_record = {
+        'timestamp': timestamp,
+        'type': event_type,
+        'description': description,
+        'severity': severity,
+        'data': data or {}
+    }
+    
+    # Write to suspicious activity log
+    with open(CHEAT_LOG, 'a') as f:
+        f.write(f"[{timestamp}] {severity}: {event_type}\n")
+        f.write(f"Description: {description}\n")
+        if data:
+            f.write(f"Data: {json.dumps(data, indent=2, default=str)}\n")
+        f.write("-" * 80 + "\n")
+    
+    # Also update fraud detector
+    fraud_detector[event_type].append(event_record)
+    
+    # Console alert
+    alert_log(f"{event_type}: {description}", severity)
 
 # --------------- NTP AND TIMING ANALYSIS ---------------
 def sync_ntp_time():
@@ -157,22 +191,21 @@ def analyze_job_timing(job_data, receive_time):
     
     # Check for suspicious timing
     if abs(timestamp_diff) > 7200:  # More than 2 hours difference
-        alert_log(f"EXTREME TIMESTAMP ANOMALY: Job timestamp off by {timestamp_diff/3600:.1f} hours", 'HIGH')
+        log_suspicious_event('timing_attacks', 
+                           f"Extreme timestamp anomaly: Job timestamp off by {timestamp_diff/3600:.1f} hours", 
+                           timing_analysis, 'HIGH')
         perf_stats['timing_anomalies'] += 1
         
-        geek_log(f"Extreme timestamp detected", {
-            'job_id': job_data['job_id'],
-            'timestamp_offset_hours': f"{timestamp_diff/3600:.2f}",
-            'job_time': datetime.fromtimestamp(job_timestamp, timezone.utc).isoformat(),
-            'actual_time': datetime.fromtimestamp(accurate_time, timezone.utc).isoformat()
-        }, 'FRAUD')
-    
     elif timestamp_diff > 600:  # More than 10 minutes in future
-        alert_log(f"FUTURE TIMESTAMP: Job is {timestamp_diff/60:.1f} minutes in the future", 'MEDIUM')
+        log_suspicious_event('timing_attacks', 
+                           f"Future timestamp: Job is {timestamp_diff/60:.1f} minutes in the future", 
+                           timing_analysis, 'MEDIUM')
         perf_stats['timing_anomalies'] += 1
     
     elif timestamp_diff < -1800:  # More than 30 minutes old
-        alert_log(f"STALE JOB: Job is {-timestamp_diff/60:.1f} minutes old", 'MEDIUM')
+        log_suspicious_event('timing_attacks', 
+                           f"Stale job: Job is {-timestamp_diff/60:.1f} minutes old", 
+                           timing_analysis, 'MEDIUM')
         perf_stats['timing_anomalies'] += 1
     
     # Log timing details in geek mode
@@ -197,7 +230,9 @@ def analyze_share_timing(miner_addr, submit_time):
             
             # Check for suspicious patterns
             if interval < 0.1:  # Less than 100ms between shares
-                alert_log(f"RAPID FIRE SHARES: {miner_addr} submitted shares {interval*1000:.1f}ms apart", 'MEDIUM')
+                log_suspicious_event('share_skimming', 
+                                   f"Rapid fire shares: {miner_addr} submitted shares {interval*1000:.1f}ms apart", 
+                                   {'miner': miner_addr, 'interval_ms': interval*1000}, 'MEDIUM')
             
             elif interval > profile['avg_share_interval'] * 10:  # Much longer than usual
                 geek_log(f"Long share interval detected", {
@@ -208,6 +243,7 @@ def analyze_share_timing(miner_addr, submit_time):
                 }, 'TECH')
     
     profile['last_share_time'] = submit_time
+
 def geek_log(msg, data=None, category='TECH'):
     """Detailed technical logging for geek mode"""
     if not GEEK_MODE:
@@ -263,22 +299,48 @@ def fast_sha256d(data):
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
 def parse_bits_fast(bits_hex):
-    """Fast bits to target conversion"""
+    """Fast bits to target conversion - fixed implementation"""
     bits = int(bits_hex, 16)
     exp = (bits >> 24) & 0xff
     mant = bits & 0xffffff
+    
     if exp <= 3:
         target = mant >> (8 * (3 - exp))
     else:
         target = mant << (8 * (exp - 3))
+    
+    # Ensure we have a valid target
+    if target == 0:
+        target = 1
+    
     return target
 
 def calculate_share_difficulty(hash_hex, target):
-    """Calculate actual difficulty of submitted share"""
-    hash_int = int(hash_hex, 16)
-    max_target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-    share_target = max(hash_int, 1)  # Avoid division by zero
-    return max_target / share_target
+    """Calculate actual difficulty of submitted share using Bitcoin's truediffone method"""
+    # Bitcoin's truediffone constant (same as in C code)
+    truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0
+    
+    # Convert hash to bytes and treat as little-endian (like le256todouble in C)
+    hash_bytes = bytes.fromhex(hash_hex)
+    
+    # Convert little-endian hash bytes to integer (reverse byte order)
+    hash_int = int.from_bytes(hash_bytes, byteorder='little')
+    
+    if hash_int == 0:
+        return float('inf')
+    
+    # Convert to float and calculate difficulty like cgminer
+    hash_as_double = float(hash_int)
+    difficulty = truediffone / hash_as_double
+    
+    geek_log(f"Share difficulty calculation (cgminer method)", {
+        'hash_hex': hash_hex[:16] + "...",
+        'hash_as_le_int': f"0x{hash_int:x}"[:18] + "...",
+        'calculated_difficulty': f"{difficulty:.6f}",
+        'method': 'truediffone / le_hash_int'
+    }, 'CRYPTO')
+    
+    return difficulty
 
 def build_merkle_fast(coinbase_hash, branches):
     """Optimized merkle root construction"""
@@ -295,19 +357,14 @@ def analyze_extranonce_allocation(extranonce1, extranonce2_size, miner_addr):
     if EXTRANONCE_FORENSICS:
         # Check for extranonce1 changes (highly suspicious)
         if profile['extranonce1'] and profile['extranonce1'] != extranonce1:
-            alert_log(f"EXTRANONCE CHANGE DETECTED: {miner_addr}", 'HIGH')
-            geek_log(f"ExtraNonce1 changed for {miner_addr}", {
-                'old': profile['extranonce1'],
-                'new': extranonce1,
-                'time_since_connect': time.time() - profile['connect_time']
-            }, 'FRAUD')
-            
-            fraud_detector['extranonce_anomalies'].append({
-                'miner': miner_addr,
-                'old_extranonce1': profile['extranonce1'],
-                'new_extranonce1': extranonce1,
-                'timestamp': time.time()
-            })
+            log_suspicious_event('extranonce_anomalies', 
+                               f"ExtraNonce1 changed for {miner_addr}", 
+                               {
+                                   'miner': miner_addr,
+                                   'old_extranonce1': profile['extranonce1'],
+                                   'new_extranonce1': extranonce1,
+                                   'time_since_connect': time.time() - profile['connect_time']
+                               }, 'HIGH')
         
         # Analyze nonce space allocation
         extranonce1_bytes = len(bytes.fromhex(extranonce1))
@@ -326,13 +383,14 @@ def analyze_extranonce_allocation(extranonce1, extranonce2_size, miner_addr):
         
         # Check for suspiciously small miner-controlled nonce space
         if extranonce2_size < 4:  # Less than 4 bytes extranonce2
-            alert_log(f"LIMITED NONCE SPACE: {miner_addr} only has {extranonce2_size} bytes extranonce2", 'MEDIUM')
-            geek_log(f"Limited nonce space detected", {
-                'miner': miner_addr,
-                'extranonce2_bytes': extranonce2_size,
-                'total_miner_space': f"2^{total_search_space_bits}",
-                'potential_issue': 'Pool may be limiting mining efficiency'
-            }, 'FRAUD')
+            log_suspicious_event('extranonce_anomalies', 
+                               f"Limited nonce space: {miner_addr} only has {extranonce2_size} bytes extranonce2", 
+                               {
+                                   'miner': miner_addr,
+                                   'extranonce2_bytes': extranonce2_size,
+                                   'total_miner_space': f"2^{total_search_space_bits}",
+                                   'potential_issue': 'Pool may be limiting mining efficiency'
+                               }, 'MEDIUM')
         
         elif extranonce2_size >= 8:  # 8+ bytes is very generous
             geek_log(f"Generous nonce space allocation", {
@@ -346,15 +404,30 @@ def analyze_extranonce_allocation(extranonce1, extranonce2_size, miner_addr):
     profile['extranonce2_size'] = extranonce2_size
 
 # --------------- SHARE DIFFICULTY ANALYSIS ---------------
-def analyze_share_submission(header_hash, target, job_data, submit_params, miner_addr):
-    """Comprehensive share analysis"""
-    hash_int = int(header_hash, 16)
+# --------------- SHARE DIFFICULTY ANALYSIS ---------------
+def analyze_share_submission(header_hash, target, job_data, submit_params, miner_addr, msg_id):
+    """Comprehensive share analysis - understanding pool vs network targets"""
+    # Convert hash to integer for comparison with target
+    hash_bytes = bytes.fromhex(header_hash)
+    hash_int = int.from_bytes(hash_bytes, byteorder='big')
+    
+    # Calculate network difficulty (from job's nbits)
     network_difficulty = 0x00000000FFFF0000000000000000000000000000000000000000000000000000 / target
+    
+    # Calculate share difficulty (what the miner actually achieved)
     share_difficulty = calculate_share_difficulty(header_hash, target)
     
     profile = miner_profiles[miner_addr]
-    profile['total_shares'] += 1
     profile['share_difficulties'].append(share_difficulty)
+    profile['total_difficulty_submitted'] += share_difficulty
+    
+    # Update best share
+    if share_difficulty > profile['best_share_difficulty']:
+        profile['best_share_difficulty'] = share_difficulty
+        geek_log(f"New best share for {miner_addr}", {
+            'difficulty': f"{share_difficulty:.6f}",
+            'previous_best': f"{profile['best_share_difficulty']:.6f}"
+        }, 'SHARE')
     
     # Share analysis
     share_analysis = {
@@ -362,27 +435,41 @@ def analyze_share_submission(header_hash, target, job_data, submit_params, miner
         'miner': miner_addr,
         'job_id': job_data['job_id'],
         'header_hash': header_hash,
-        'target': hex(target),
+        'network_target': hex(target),
         'network_difficulty': network_difficulty,
         'share_difficulty': share_difficulty,
-        'hash_ratio': hash_int / target,
-        'is_block': hash_int < target,
+        'would_be_block': hash_int <= target,  # Only if it meets network target
         'nonce': submit_params[4],
-        'extranonce2': submit_params[2]
+        'extranonce2': submit_params[2],
+        'msg_id': msg_id,
+        'hash_int': hash_int
     }
     
     share_database.append(share_analysis)
     
+    # Store pending share for response tracking
+    pending_shares[msg_id] = {
+        'miner': miner_addr,
+        'difficulty': share_difficulty,
+        'submit_time': time.time(),
+        'share_analysis': share_analysis
+    }
+    
+    # Update global stats
+    perf_stats['total_difficulty_submitted'] += share_difficulty
+    
     if SHARE_DIFFICULTY_TRACKING:
         geek_log(f"Share analysis for {miner_addr}", {
-            'share_difficulty': f"{share_difficulty:.2f}",
+            'share_difficulty': f"{share_difficulty:.6f}",
             'network_difficulty': f"{network_difficulty:.0f}",
-            'hash_ratio': f"{hash_int / target:.6f}",
-            'over_target': hash_int > target
+            'hash_int': f"0x{hash_int:064x}",
+            'network_target': f"0x{target:064x}",
+            'note': 'Pool has separate easier share target',
+            'msg_id': msg_id
         }, 'SHARE')
     
-    # Check for block detection
-    if hash_int < target:
+    # Check for actual block (network target)
+    if hash_int <= target:
         perf_stats['blocks_detected'] += 1
         clean_log(f"🎉 BLOCK FOUND BY {miner_addr}! Difficulty: {share_difficulty:.0f}", 'SUCCESS')
         
@@ -392,22 +479,89 @@ def analyze_share_submission(header_hash, target, job_data, submit_params, miner
             f.write(f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n")
             f.write(f"Miner: {miner_addr}\n")
             f.write(f"Block Hash: {header_hash}\n")
-            f.write(f"Difficulty: {share_difficulty}\n")
+            f.write(f"Hash Int: 0x{hash_int:064x}\n")
+            f.write(f"Network Target: 0x{target:064x}\n")
+            f.write(f"Share Difficulty: {share_difficulty}\n")
             f.write(f"Job ID: {job_data['job_id']}\n")
             f.write(f"Nonce: {submit_params[4]}\n")
             f.write(f"ExtraNonce2: {submit_params[2]}\n\n")
         
         return True
     
-    # Near-miss detection
-    if 1.0 < (hash_int / target) < 1.05:  # Within 5% of target
+    # Near-miss detection for network target
+    miss_ratio = hash_int / target
+    if 1.0 < miss_ratio < 1.05:
         perf_stats['near_misses'] += 1
         geek_log(f"Near-miss detected from {miner_addr}", {
-            'how_close': f"{((hash_int / target) - 1) * 100:.3f}% over target",
-            'share_difficulty': share_difficulty
+            'how_close': f"{(miss_ratio - 1) * 100:.3f}% over network target",
+            'share_difficulty': f"{share_difficulty:.6f}",
+            'note': 'Close to finding a block!'
         }, 'CRYPTO')
     
     return False
+
+def handle_share_response(msg, miner_addr):
+    """Handle pool response to share submission - extract actual difficulty if available"""
+    msg_id = msg.get('id')
+    if not msg_id or msg_id not in pending_shares:
+        return
+    
+    share_info = pending_shares[msg_id]
+    result = msg.get('result')
+    error = msg.get('error')
+    
+    # Update miner profile
+    profile = miner_profiles[share_info['miner']]
+    
+    if result is True and error is None:
+        # Share accepted
+        profile['accepted_shares'] += 1
+        perf_stats['total_shares_accepted'] += 1
+        
+        # Use the pool-set difficulty (not calculated)
+        pool_diff = share_info['pool_difficulty']
+        profile['total_difficulty_submitted'] += pool_diff
+        perf_stats['total_difficulty_submitted'] += pool_diff
+        
+        if pool_diff > profile['best_share_difficulty']:
+            profile['best_share_difficulty'] = pool_diff
+        
+        clean_log(f"✅ SHARE ACCEPTED from {share_info['miner']} | Pool Diff: {pool_diff}")
+        
+        geek_log(f"Share accepted", {
+            'miner': share_info['miner'],
+            'pool_difficulty': pool_diff,
+            'response_time': f"{(time.time() - share_info['submit_time']) * 1000:.1f}ms",
+            'msg_id': msg_id,
+            'note': 'Using pool-assigned difficulty'
+        }, 'SHARE')
+        
+    else:
+        # Share rejected
+        profile['rejected_shares'] += 1
+        perf_stats['total_shares_rejected'] += 1
+        
+        error_msg = error[1] if error and len(error) > 1 else 'Unknown error'
+        clean_log(f"❌ SHARE REJECTED from {share_info['miner']} | Error: {error_msg}")
+        
+        # Log rejection for analysis
+        log_suspicious_event('share_difficulty_manipulation', 
+                           f"Share rejected: {error_msg}", 
+                           {
+                               'miner': share_info['miner'],
+                               'pool_difficulty': share_info['pool_difficulty'],
+                               'error': error_msg,
+                               'msg_id': msg_id
+                           }, 'LOW')
+    
+    # Calculate session hash rate using pool difficulty
+    if len(profile['share_difficulties']) > 5:
+        session_time = time.time() - profile['connect_time']
+        # Hash rate = (total_difficulty * 2^32) / time_in_seconds
+        profile['session_hash_rate'] = (profile['total_difficulty_submitted'] * (2**32)) / session_time
+    
+    # Remove from pending
+    del pending_shares[msg_id]
 
 # --------------- HIGH-PERFORMANCE MESSAGE HANDLERS ---------------
 def handle_notify_fast(msg):
@@ -440,7 +594,7 @@ def handle_notify_fast(msg):
     # Analyze job timing for manipulation
     analyze_job_timing(job_data, receive_time)
     
-    clean_log(f"📋 New job {job_id[:8]}... | Difficulty: {difficulty:.0f} | Merkle branches: {len(job_data['merkle_branch'])}")
+    clean_log(f"📋 New job {job_id[:8]}... | Network Difficulty: {difficulty:.0f} | Merkle branches: {len(job_data['merkle_branch'])}")
     
     if GEEK_MODE:
         job_timestamp = int(job_data['ntime'], 16)
@@ -448,7 +602,7 @@ def handle_notify_fast(msg):
         
         geek_log(f"Job notification processed", {
             'job_id': job_id,
-            'difficulty': f"{difficulty:.0f}",
+            'network_difficulty': f"{difficulty:.0f}",
             'clean_jobs': job_data['clean_jobs'],
             'coinbase_size': len(job_data['coinb1']) + len(job_data['coinb2']),
             'merkle_branches': len(job_data['merkle_branch']),
@@ -457,8 +611,26 @@ def handle_notify_fast(msg):
             'processing_time_us': f"{(time.perf_counter() - start_time) * 1000000:.1f}"
         }, 'TECH')
 
+def handle_set_difficulty(msg, addr):
+    """Handle pool setting share difficulty for miner"""
+    params = msg.get('params', [])
+    if len(params) < 1:
+        return
+    
+    share_difficulty = params[0]
+    profile = miner_profiles[addr]
+    profile['current_pool_difficulty'] = share_difficulty
+    
+    clean_log(f"🎯 Pool set difficulty for {addr}: {share_difficulty}")
+    
+    geek_log(f"Pool difficulty set", {
+        'miner': addr,
+        'share_difficulty': share_difficulty,
+        'worker': profile['worker_name']
+    }, 'TECH')
+
 def handle_submit_fast(msg, sock, addr):
-    """Ultra-fast share submission handling with comprehensive analysis"""
+    """Ultra-fast share submission handling - passive monitoring only"""
     start_time = time.perf_counter()
     submit_time = get_accurate_time()
     
@@ -467,6 +639,8 @@ def handle_submit_fast(msg, sock, addr):
         return
     
     worker, job_id, extranonce2, ntime, nonce = params[:5]
+    version_hex = params[5] if len(params) > 5 else None
+    msg_id = msg.get('id')
     
     # Update counters
     perf_stats['total_shares_submitted'] += 1
@@ -477,85 +651,75 @@ def handle_submit_fast(msg, sock, addr):
     # Analyze share timing patterns
     analyze_share_timing(addr, submit_time)
     
-    # Get cached data
+    # Get cached data for basic analysis
     template = job_templates.get(job_id)
     socket_id = id(sock)
     extranonce_info = extranonce_registry.get(socket_id)
     
-    if not template or not extranonce_info:
-        geek_log(f"Missing data for share submission", {
-            'has_template': bool(template),
-            'has_extranonce': bool(extranonce_info),
-            'job_id': job_id
-        }, 'TECH')
-        return
+    # Use pool-set difficulty (not calculated difficulty)
+    pool_diff = profile.get('current_pool_difficulty', 0)
     
-    # Build block header (optimized)
-    extranonce1 = extranonce_info['extranonce1']
-    coinbase = template['coinb1'] + extranonce1 + extranonce2 + template['coinb2']
-    coinbase_hash = fast_sha256d(bytes.fromhex(coinbase)).hex()
-    merkle_root = build_merkle_fast(coinbase_hash, template['merkle_branch'])
+    if template:
+        job_age = submit_time - template.get('receive_time', submit_time)
+    else:
+        job_age = 0
     
-    # Construct header
-    version = struct.pack('<I', int(template['version'], 16))
-    prevhash = bytes.fromhex(template['prevhash'])[::-1]
-    merkle = bytes.fromhex(merkle_root)[::-1]
-    timestamp = struct.pack('<I', int(ntime, 16))
-    bits = struct.pack('<I', int(template['nbits'], 16))
-    nonce_bytes = struct.pack('<I', int(nonce, 16))
+    # Simple logging without hash calculations
+    clean_log(f"📤 SHARE from {addr} | Worker: {worker} | Job: {job_id[:8]}... | Nonce: {nonce} | Pool Diff: {pool_diff}")
     
-    header = version + prevhash + merkle + timestamp + bits + nonce_bytes
-    header_hash = fast_sha256d(header)[::-1].hex()
-    target = parse_bits_fast(template['nbits'])
-    
-    # Calculate share difficulty and timing
-    share_difficulty = calculate_share_difficulty(header_hash, target)
-    job_age = submit_time - template.get('receive_time', submit_time)
-    
-    # Enhanced logging
-    clean_log(f"📤 SHARE from {addr} | Worker: {worker} | Job: {job_id[:8]}... | Nonce: {nonce} | Difficulty: {share_difficulty:.1f}")
+    # Store share for response tracking (without calculated difficulty)
+    pending_shares[msg_id] = {
+        'miner': addr,
+        'pool_difficulty': pool_diff,
+        'submit_time': submit_time,
+        'job_id': job_id,
+        'nonce': nonce,
+        'extranonce2': extranonce2
+    }
     
     # Detailed geek analysis
     if GEEK_MODE:
-        geek_log(f"Share submission analysis", {
+        geek_log(f"Share submission (passive monitoring)", {
             'worker': worker,
-            'share_difficulty': f"{share_difficulty:.2f}",
+            'pool_set_difficulty': pool_diff,
             'job_age_seconds': f"{job_age:.1f}",
             'ntime': ntime,
             'extranonce2': extranonce2,
-            'coinbase_size_bytes': len(coinbase) // 2,
-            'header_hash': header_hash[:16] + "...",
-            'submission_interval': f"{submit_time - profile['last_share_time']:.1f}s" if profile['last_share_time'] > 0 else "first"
+            'nonce': nonce,
+            'version': version_hex if version_hex else 'from_job',
+            'submission_interval': f"{submit_time - profile['last_share_time']:.1f}s" if profile['last_share_time'] > 0 else "first",
+            'msg_id': msg_id,
+            'note': 'Difficulty will be confirmed by pool response'
         }, 'SHARE')
     
     # Check for timing anomalies in ntime
-    submit_ntime = int(ntime, 16)
-    current_time = submit_time
-    ntime_diff = submit_ntime - current_time
+    if template:
+        submit_ntime = int(ntime, 16)
+        current_time = submit_time
+        ntime_diff = submit_ntime - current_time
+        
+        if abs(ntime_diff) > 3600:  # ntime more than 1 hour off
+            log_suspicious_event('timing_attacks', 
+                               f"ntime anomaly: {addr} submitted ntime {ntime_diff/3600:.1f} hours off", 
+                               {
+                                   'miner': addr,
+                                   'ntime_hex': ntime,
+                                   'ntime_timestamp': submit_ntime,
+                                   'current_timestamp': current_time,
+                                   'difference_hours': ntime_diff/3600
+                               }, 'HIGH')
     
-    if abs(ntime_diff) > 3600:  # ntime more than 1 hour off
-        alert_log(f"NTIME ANOMALY: {addr} submitted ntime {ntime_diff/3600:.1f} hours off", 'HIGH')
-        geek_log(f"ntime analysis", {
-            'ntime_hex': ntime,
-            'ntime_timestamp': submit_ntime,
-            'current_timestamp': current_time,
-            'difference_hours': f"{ntime_diff/3600:.2f}"
-        }, 'FRAUD')
-    
-    # Share analysis and block detection
-    is_block = analyze_share_submission(header_hash, target, template, params, addr)
-    
-    # Log to share analysis file
+    # Log to share analysis file (without calculated difficulty)
     with open(SHARE_LOG, 'a') as f:
-        f.write(f"{datetime.fromtimestamp(submit_time, timezone.utc).isoformat()},{addr},{worker},{job_id},{nonce},{share_difficulty:.2f},{job_age:.1f},{is_block}\n")
+        f.write(f"{datetime.fromtimestamp(submit_time, timezone.utc).isoformat()},{addr},{worker},{job_id},{nonce},{pool_diff:.6f},{job_age:.1f},pending,{msg_id}\n")
     
     processing_time = (time.perf_counter() - start_time) * 1000000
     
-    if GEEK_MODE and processing_time > 100:  # Only log if > 100 microseconds
+    if GEEK_MODE and processing_time > 100:
         geek_log(f"Share processing completed", {
             'processing_time_us': f"{processing_time:.1f}",
-            'is_potential_block': is_block,
-            'total_shares_this_session': profile['total_shares']
+            'total_shares_this_session': profile['total_shares'],
+            'note': 'No hash calculation - pure passthrough monitoring'
         }, 'PERF')
 
 def handle_subscribe_fast(msg, sock, addr):
@@ -619,15 +783,21 @@ def lightning_forward(src, dst, direction, addr):
                     if direction == 'pool_to_miner':
                         if msg.get('method') == 'mining.notify':
                             handle_notify_fast(msg)
+                        elif msg.get('method') == 'mining.set_difficulty':
+                            handle_set_difficulty(msg, addr)
                         elif msg.get('id') == 2:  # subscribe response
                             handle_subscribe_fast(msg, dst, addr)
+                        elif 'result' in msg and msg.get('id'):  # Share response
+                            handle_share_response(msg, addr)
                     
                     elif direction == 'miner_to_pool':
                         if msg.get('method') == 'mining.submit':
                             handle_submit_fast(msg, src, addr)
                         elif msg.get('method') == 'mining.authorize':
                             worker = msg.get('params', [None])[0]
-                            miner_profiles[addr]['worker_name'] = worker
+                            if worker:
+                                miner_profiles[addr]['worker_name'] = worker
+                                clean_log(f"Worker authorized: {worker} from {addr}")
                 
                 except (json.JSONDecodeError, KeyError):
                     pass  # Ignore malformed messages - keep forwarding fast
@@ -739,7 +909,7 @@ def performance_monitor():
               f"Msg/s: {messages_per_second:.1f} | "
               f"Shares/min: {shares_per_minute:.1f}{Colors.END}")
         
-        # Enhanced processing stats
+        # Enhanced processing stats with acceptance rate
         total_shares = perf_stats['total_shares_submitted']
         if total_shares > 0:
             accept_rate = perf_stats['total_shares_accepted'] / total_shares
@@ -747,10 +917,13 @@ def performance_monitor():
             accept_color = Colors.GREEN if accept_rate > 0.95 else Colors.YELLOW if accept_rate > 0.90 else Colors.RED
             
             print(f"{Colors.GREEN}📈 SHARES: {total_shares} submitted | "
-                  f"{accept_color}Accept: {accept_rate:.1%}{Colors.END} | "
-                  f"{Colors.RED}Reject: {reject_rate:.1%}{Colors.END} | "
+                  f"{accept_color}Accept: {perf_stats['total_shares_accepted']} ({accept_rate:.1%}){Colors.END} | "
+                  f"{Colors.RED}Reject: {perf_stats['total_shares_rejected']} ({reject_rate:.1%}){Colors.END} | "
                   f"Blocks: {perf_stats['blocks_detected']} | "
-                  f"Near-misses: {perf_stats['near_misses']}{Colors.END}")
+                  f"Near-misses: {perf_stats['near_misses']}")
+            
+            # Total difficulty submitted
+            print(f"{Colors.MAGENTA}💎 DIFFICULTY: Total submitted: {perf_stats['total_difficulty_submitted']:.0f}{Colors.END}")
         
         # Timing analysis summary
         if TIMING_ANALYSIS and len(timing_database) > 0:
@@ -771,7 +944,7 @@ def performance_monitor():
             print(f"{ntp_color}🌐 NTP: Last sync {ntp_age/60:.0f}m ago | "
                   f"Offset: {ntp_offset*1000:.1f}ms{Colors.END}")
         
-        # Miner summary
+        # Miner summary with enhanced stats
         if miner_profiles:
             active_miners = [addr for addr, profile in miner_profiles.items() 
                            if current_time - profile['connect_time'] < uptime]
@@ -787,15 +960,19 @@ def performance_monitor():
                     session_time = current_time - profile['connect_time']
                     shares_per_hour = profile['total_shares'] / (session_time / 3600) if session_time > 0 else 0
                     accept_rate = profile['accepted_shares'] / profile['total_shares'] if profile['total_shares'] > 0 else 0
+                    hash_rate_gh = profile['session_hash_rate'] / 1e9 if profile['session_hash_rate'] > 0 else 0
                     
                     print(f"{Colors.DIM}   {addr}: {profile['total_shares']} shares | "
                           f"{shares_per_hour:.1f}/hr | "
                           f"{accept_rate:.1%} accept | "
+                          f"Best: {profile['best_share_difficulty']:.1f} | "
+                          f"Rate: {hash_rate_gh:.1f}GH/s | "
                           f"Worker: {profile['worker_name']}{Colors.END}")
         
         # Security status
         if perf_stats['suspicious_events'] > 0:
             print(f"{Colors.RED}🚨 SECURITY: {perf_stats['suspicious_events']} suspicious events detected{Colors.END}")
+            print(f"{Colors.YELLOW}   Check {CHEAT_LOG} for detailed analysis{Colors.END}")
         else:
             print(f"{Colors.GREEN}✅ SECURITY: All systems normal - no suspicious activity{Colors.END}")
         
@@ -816,6 +993,10 @@ def main():
     clean_log(f"🛡️ Extranonce forensics: {EXTRANONCE_FORENSICS}")
     clean_log(f"🕐 Timing analysis: {TIMING_ANALYSIS} | NTP verification: {NTP_VERIFICATION}")
     
+    # Initialize log files
+    with open(CHEAT_LOG, 'w') as f:
+        f.write(f"=== SUSPICIOUS ACTIVITY LOG - {datetime.now(timezone.utc).isoformat()} ===\n\n")
+    
     # Initialize NTP synchronization
     if NTP_VERIFICATION:
         clean_log("🌐 Synchronizing with NTP servers...")
@@ -826,7 +1007,7 @@ def main():
     
     # Create share analysis log header
     with open(SHARE_LOG, 'w') as f:
-        f.write("timestamp,miner_addr,worker,job_id,nonce,share_difficulty,job_age_seconds,is_block\n")
+        f.write("timestamp,miner_addr,worker,job_id,nonce,share_difficulty,job_age_seconds,is_block,msg_id\n")
     
     # Start performance monitor
     monitor_thread = threading.Thread(target=performance_monitor, daemon=True)
@@ -874,7 +1055,9 @@ def main():
         total_shares = perf_stats['total_shares_submitted']
         if total_shares > 0:
             accept_rate = perf_stats['total_shares_accepted'] / total_shares
-            print(f"{Colors.GREEN}📊 Final Stats: {total_shares} shares | {accept_rate:.1%} acceptance rate{Colors.END}")
+            print(f"{Colors.GREEN}📊 Final Stats: {total_shares} shares | "
+                  f"{perf_stats['total_shares_accepted']} accepted ({accept_rate:.1%}) | "
+                  f"Total difficulty: {perf_stats['total_difficulty_submitted']:.0f}{Colors.END}")
 
 if __name__ == '__main__':
     try:

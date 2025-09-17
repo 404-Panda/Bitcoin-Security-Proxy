@@ -119,7 +119,7 @@ Geek Mode Analysis
        extranonce2_quality: generous
 
 [GEEK] [18:26:19.168] SHARE: Share submission analysis
-       worker: bc1qtesc50ye5euqtr67sdqke8xdwef6klasc5vx59.Satoshi
+       worker: bc1
        share_difficulty: 1024.50
        job_age_seconds: 2.1
        ntime: 68c9a6b5

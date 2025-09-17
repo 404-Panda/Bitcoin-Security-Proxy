@@ -20,24 +20,24 @@ LISTEN_PORT = 3334
 POOL_HOST = 'solo.ckpool.org'
 POOL_PORT = 3333
 BUFFER_SIZE = 16384  # Larger buffers for performance
-SOCKET_TIMEOUT = 0.1  # Fast socket operations
+SOCKET_TIMEOUT = 0.1
 
 # Mining address for pool stats (user configurable)
-MINING_ADDRESS = "bc1qtesc50ye5euqtr67sdqke8xdwef6klasc5vx59"  # Hardcoded for testing
+MINING_ADDRESS = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"  # ADD ADDRESS HERE
 POOL_STATS_URL = f"https://solo.ckpool.org/users/{MINING_ADDRESS}" if MINING_ADDRESS else ""
-LAST_POOL_STATS_UPDATE = 0  # Track last update time
-POOL_STATS_CACHE = {}  # Cache pool stats
+LAST_POOL_STATS_UPDATE = 0
+POOL_STATS_CACHE = {}
 
 # Geek mode settings
-GEEK_MODE = True  # Detailed technical output
+GEEK_MODE = True
 SHARE_DIFFICULTY_TRACKING = True
 EXTRANONCE_FORENSICS = True
-TIMING_ANALYSIS = True  # Deep timing attack detection
-NTP_VERIFICATION = True  # Use NTP for timing reference
+TIMING_ANALYSIS = True
+NTP_VERIFICATION = True
 
 # NTP servers for time verification
 NTP_SERVERS = ['pool.ntp.org', 'time.google.com', 'time.cloudflare.com']
-ntp_offset = 0  # Offset between local time and NTP time
+ntp_offset = 0
 
 # File logging
 LOGFILE = 'ultra_proxy.log'
@@ -261,7 +261,7 @@ def setup_mining_address():
     
     print(f"\n{Colors.CYAN}{Colors.BOLD}Mining Address Setup{Colors.END}")
     print(f"{Colors.BLUE}To get accurate hashrate statistics from the pool, please enter your mining address.{Colors.END}")
-    print(f"{Colors.DIM}Example: bc1qtesc50ye5euqtr67sdqke8xdwef6klasc5vx59{Colors.END}")
+    print(f"{Colors.DIM}Example: 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa{Colors.END}")
     
     while True:
         try:
@@ -452,7 +452,7 @@ def parse_bits_fast(bits_hex):
 
 def calculate_share_difficulty(hash_hex, target):
     """Calculate actual difficulty of submitted share using Bitcoin's truediffone method"""
-    # Bitcoin's truediffone constant (same as in C code)
+    # Bitcoin's truediffone constant (same as in C code in bitaxe)
     truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0
     
     # Convert hash to bytes and treat as little-endian (like le256todouble in C)
@@ -539,10 +539,9 @@ def analyze_extranonce_allocation(extranonce1, extranonce2_size, miner_addr):
     profile['extranonce2_size'] = extranonce2_size
 
 # --------------- SHARE DIFFICULTY ANALYSIS ---------------
-# --------------- SHARE DIFFICULTY ANALYSIS ---------------
 def analyze_share_submission(header_hash, target, job_data, submit_params, miner_addr, msg_id):
     """Comprehensive share analysis - understanding pool vs network targets"""
-    # Convert hash to integer for comparison with target
+    # Converts hash to integer for comparison with target
     hash_bytes = bytes.fromhex(header_hash)
     hash_int = int.from_bytes(hash_bytes, byteorder='big')
     
@@ -1189,7 +1188,7 @@ def main():
     with open(CHEAT_LOG, 'w') as f:
         f.write(f"=== SUSPICIOUS ACTIVITY LOG - {datetime.now(timezone.utc).isoformat()} ===\n\n")
     
-    # Initialize NTP synchronization
+    # Initialize NTP synchronization / Test more NTP or allow user to auto select NTP to use?
     if NTP_VERIFICATION:
         clean_log("🌐 Synchronizing with NTP servers...")
         if sync_ntp_time():

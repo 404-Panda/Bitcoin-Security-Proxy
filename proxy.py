@@ -228,13 +228,13 @@ def analyze_share_timing(miner_addr, submit_time):
         if len(profile['share_submission_times']) >= 5:
             profile['avg_share_interval'] = statistics.mean(profile['share_submission_times'])
             
-            # Check for suspicious patterns
-            if interval < 0.1:  # Less than 100ms between shares
+            # Check for suspicious patterns (much more restrictive)
+            if interval < 0.005:  # Less than 5ms between shares (extremely suspicious)
                 log_suspicious_event('share_skimming', 
-                                   f"Rapid fire shares: {miner_addr} submitted shares {interval*1000:.1f}ms apart", 
-                                   {'miner': miner_addr, 'interval_ms': interval*1000}, 'MEDIUM')
+                                   f"Extremely rapid shares: {miner_addr} submitted shares {interval*1000:.1f}ms apart", 
+                                   {'miner': miner_addr, 'interval_ms': interval*1000}, 'HIGH')
             
-            elif interval > profile['avg_share_interval'] * 10:  # Much longer than usual
+            elif interval > profile['avg_share_interval'] * 20:  # Much longer than usual (20x average)
                 geek_log(f"Long share interval detected", {
                     'miner': miner_addr,
                     'interval_seconds': f"{interval:.1f}",
@@ -541,24 +541,46 @@ def handle_share_response(msg, miner_addr):
         profile['rejected_shares'] += 1
         perf_stats['total_shares_rejected'] += 1
         
-        error_msg = error[1] if error and len(error) > 1 else 'Unknown error'
+        # Better error message parsing
+        if error and isinstance(error, list) and len(error) > 1:
+            error_msg = str(error[1])
+        elif error and isinstance(error, str):
+            error_msg = error
+        elif result is False:
+            error_msg = "Share rejected (result: false)"
+        else:
+            error_msg = "Unknown rejection reason"
+        
         clean_log(f"❌ SHARE REJECTED from {share_info['miner']} | Error: {error_msg}")
         
-        # Log rejection for analysis
-        log_suspicious_event('share_difficulty_manipulation', 
-                           f"Share rejected: {error_msg}", 
-                           {
-                               'miner': share_info['miner'],
-                               'pool_difficulty': share_info['pool_difficulty'],
-                               'error': error_msg,
-                               'msg_id': msg_id
-                           }, 'LOW')
+        # Only log as suspicious if it's not a common rejection reason
+        common_rejections = ['stale', 'duplicate', 'low difficulty', 'job not found']
+        is_suspicious = not any(reason in error_msg.lower() for reason in common_rejections)
+        
+        if is_suspicious:
+            log_suspicious_event('share_difficulty_manipulation', 
+                               f"Share rejected: {error_msg}", 
+                               {
+                                   'miner': share_info['miner'],
+                                   'pool_difficulty': share_info['pool_difficulty'],
+                                   'error': error_msg,
+                                   'msg_id': msg_id
+                               }, 'LOW')
+        else:
+            # Just log normal rejections in geek mode
+            geek_log(f"Normal share rejection", {
+                'miner': share_info['miner'],
+                'error': error_msg,
+                'msg_id': msg_id,
+                'note': 'Common rejection - not suspicious'
+            }, 'SHARE')
     
     # Calculate session hash rate using pool difficulty
     if len(profile['share_difficulties']) > 5:
         session_time = time.time() - profile['connect_time']
         # Hash rate = (total_difficulty * 2^32) / time_in_seconds
-        profile['session_hash_rate'] = (profile['total_difficulty_submitted'] * (2**32)) / session_time
+        if session_time > 0:
+            profile['session_hash_rate'] = (profile['total_difficulty_submitted'] * (2**32)) / session_time
     
     # Remove from pending
     del pending_shares[msg_id]

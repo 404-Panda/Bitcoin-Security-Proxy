@@ -9,17 +9,24 @@ import hashlib
 import time
 import struct
 import ntplib
+import requests
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 import statistics
 
-# --------------- PERFORMANCE CONFIG ---------------
+# --------------- CONFIGURATION ---------------
 LISTEN_HOST = '0.0.0.0'
 LISTEN_PORT = 3334
 POOL_HOST = 'solo.ckpool.org'
 POOL_PORT = 3333
 BUFFER_SIZE = 16384  # Larger buffers for performance
 SOCKET_TIMEOUT = 0.1  # Fast socket operations
+
+# Mining address for pool stats (user configurable)
+MINING_ADDRESS = "bc1qtesc50ye5euqtr67sdqke8xdwef6klasc5vx59"  # Hardcoded for testing
+POOL_STATS_URL = f"https://solo.ckpool.org/users/{MINING_ADDRESS}" if MINING_ADDRESS else ""
+LAST_POOL_STATS_UPDATE = 0  # Track last update time
+POOL_STATS_CACHE = {}  # Cache pool stats
 
 # Geek mode settings
 GEEK_MODE = True  # Detailed technical output
@@ -163,7 +170,135 @@ def sync_ntp_time():
     alert_log("All NTP servers failed - using local time", 'MEDIUM')
     return False
 
+# --------------- POOL STATS INTEGRATION ---------------
 def get_accurate_time():
+    """Get NTP-corrected time"""
+    return time.time() + ntp_offset
+
+def fetch_pool_stats():
+    """Fetch mining stats from pool API"""
+    global LAST_POOL_STATS_UPDATE, POOL_STATS_CACHE
+    
+    current_time = time.time()
+    
+    # Only update every 60 seconds to avoid flooding the pool
+    if current_time - LAST_POOL_STATS_UPDATE < 60:
+        return POOL_STATS_CACHE
+    
+    if not POOL_STATS_URL:
+        return {}
+    
+    try:
+        response = requests.get(POOL_STATS_URL, timeout=10)
+        if response.status_code == 200:
+            pool_data = response.json()
+            POOL_STATS_CACHE = pool_data
+            LAST_POOL_STATS_UPDATE = current_time
+            
+            geek_log(f"Pool stats updated", {
+                'total_hashrate': pool_data.get('hashrate1m', 'unknown'),
+                'workers': pool_data.get('workers', 0),
+                'bestshare': pool_data.get('bestshare', 0),
+                'update_time': datetime.fromtimestamp(current_time).strftime("%H:%M:%S")
+            }, 'TECH')
+            
+            return pool_data
+        else:
+            clean_log(f"Failed to fetch pool stats: HTTP {response.status_code}", 'WARN')
+            return POOL_STATS_CACHE
+            
+    except Exception as e:
+        geek_log(f"Pool stats fetch error: {e}", category='TECH')
+        return POOL_STATS_CACHE
+
+def get_worker_stats(worker_name):
+    """Get specific worker stats from pool data"""
+    pool_data = fetch_pool_stats()
+    
+    if 'worker' not in pool_data:
+        return {}
+    
+    for worker in pool_data['worker']:
+        if worker.get('workername') == worker_name:
+            return worker
+    
+    return {}
+
+def parse_hashrate_string(hashrate_str):
+    """Parse hashrate strings like '487G', '1.2T' to GH/s"""
+    if not hashrate_str:
+        return 0.0
+    
+    try:
+        # Remove any spaces and convert to upper
+        hashrate_str = str(hashrate_str).replace(' ', '').upper()
+        
+        # Extract number and unit
+        if hashrate_str[-1] in ['T', 'G', 'M', 'K']:
+            unit = hashrate_str[-1]
+            number = float(hashrate_str[:-1])
+        else:
+            unit = 'H'
+            number = float(hashrate_str)
+        
+        # Convert to GH/s
+        multipliers = {
+            'T': 1000,    # TH/s to GH/s
+            'G': 1,       # GH/s
+            'M': 0.001,   # MH/s to GH/s
+            'K': 0.000001, # KH/s to GH/s
+            'H': 0.000000001 # H/s to GH/s
+        }
+        
+        return number * multipliers.get(unit, 1)
+        
+    except (ValueError, IndexError):
+        return 0.0
+
+def setup_mining_address():
+    """Setup mining address for pool stats"""
+    global MINING_ADDRESS, POOL_STATS_URL
+    
+    print(f"\n{Colors.CYAN}{Colors.BOLD}Mining Address Setup{Colors.END}")
+    print(f"{Colors.BLUE}To get accurate hashrate statistics from the pool, please enter your mining address.{Colors.END}")
+    print(f"{Colors.DIM}Example: bc1qtesc50ye5euqtr67sdqke8xdwef6klasc5vx59{Colors.END}")
+    
+    while True:
+        try:
+            address = input(f"\n{Colors.CYAN}Enter your mining address (or press Enter to skip): {Colors.END}").strip()
+            
+            if not address:
+                clean_log("Skipping pool stats integration - hashrate will not be available", 'WARN')
+                return
+            
+            # Basic validation - Bitcoin addresses are typically 26-62 characters
+            if len(address) < 26 or len(address) > 62:
+                print(f"{Colors.RED}Invalid address length. Bitcoin addresses are typically 26-62 characters.{Colors.END}")
+                continue
+            
+            MINING_ADDRESS = address
+            POOL_STATS_URL = f"https://{POOL_HOST}/users/{address}"
+            
+            # Test the API endpoint
+            clean_log(f"Testing pool stats API: {POOL_STATS_URL}")
+            test_stats = fetch_pool_stats()
+            
+            if test_stats:
+                total_hashrate = test_stats.get('hashrate1m', 'unknown')
+                workers = test_stats.get('workers', 0)
+                clean_log(f"Pool stats connected successfully!", 'SUCCESS')
+                clean_log(f"Total hashrate: {total_hashrate}, Workers: {workers}", 'SUCCESS')
+                break
+            else:
+                print(f"{Colors.RED}Could not fetch stats for this address. Please check the address and try again.{Colors.END}")
+                continue
+                
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}Setup cancelled{Colors.END}")
+            return
+        except Exception as e:
+            print(f"{Colors.RED}Error: {e}{Colors.END}")
+            continue
     """Get NTP-corrected time"""
     return time.time() + ntp_offset
 
@@ -966,14 +1101,21 @@ def performance_monitor():
             print(f"{ntp_color}🌐 NTP: Last sync {ntp_age/60:.0f}m ago | "
                   f"Offset: {ntp_offset*1000:.1f}ms{Colors.END}")
         
-        # Miner summary with enhanced stats
+        # Miner summary with pool stats integration
         if miner_profiles:
             active_miners = [addr for addr, profile in miner_profiles.items() 
                            if current_time - profile['connect_time'] < uptime]
             
             print(f"{Colors.CYAN}⛏️  MINERS: {len(active_miners)} active{Colors.END}")
             
-            # Show top miners by share count
+            # Get pool stats for enhanced display
+            pool_data = fetch_pool_stats() if POOL_STATS_URL else {}
+            
+            if pool_data:
+                total_pool_hashrate = pool_data.get('hashrate1m', 'unknown')
+                print(f"{Colors.MAGENTA}🌊 POOL STATS: Total hashrate: {total_pool_hashrate} | Workers: {pool_data.get('workers', 0)} | Best share: {pool_data.get('bestshare', 0):.0f}{Colors.END}")
+            
+            # Show top miners by share count with pool hashrate data
             top_miners = sorted(miner_profiles.items(), 
                               key=lambda x: x[1]['total_shares'], reverse=True)[:3]
             
@@ -982,14 +1124,42 @@ def performance_monitor():
                     session_time = current_time - profile['connect_time']
                     shares_per_hour = profile['total_shares'] / (session_time / 3600) if session_time > 0 else 0
                     accept_rate = profile['accepted_shares'] / profile['total_shares'] if profile['total_shares'] > 0 else 0
-                    hash_rate_gh = profile['session_hash_rate'] / 1e9 if profile['session_hash_rate'] > 0 else 0
+                    
+                    # Try to get pool hashrate for this worker
+                    worker_stats = get_worker_stats(profile['worker_name']) if POOL_STATS_URL else {}
+                    pool_hashrate_str = "unknown"
+                    
+                    if worker_stats:
+                        pool_hashrate_1m = worker_stats.get('hashrate1m', '')
+                        if pool_hashrate_1m:
+                            pool_hashrate_gh = parse_hashrate_string(pool_hashrate_1m)
+                            pool_hashrate_str = f"{pool_hashrate_gh:.1f}GH/s"
+                        
+                        # Also show pool's best share for this worker
+                        pool_best_share = worker_stats.get('bestshare', 0)
+                        if pool_best_share > profile['best_share_difficulty']:
+                            profile['best_share_difficulty'] = pool_best_share
+                    else:
+                        # If no pool stats, show that it's not available
+                        pool_hashrate_str = "no pool data"
                     
                     print(f"{Colors.DIM}   {addr}: {profile['total_shares']} shares | "
                           f"{shares_per_hour:.1f}/hr | "
                           f"{accept_rate:.1%} accept | "
                           f"Best: {profile['best_share_difficulty']:.1f} | "
-                          f"Rate: {hash_rate_gh:.1f}GH/s | "
+                          f"Rate: {pool_hashrate_str} | "
                           f"Worker: {profile['worker_name']}{Colors.END}")
+                    
+                    # Show additional pool stats if available
+                    if worker_stats and GEEK_MODE:
+                        geek_log(f"Pool stats for {profile['worker_name']}", {
+                            'hashrate_1m': worker_stats.get('hashrate1m', 'unknown'),
+                            'hashrate_5m': worker_stats.get('hashrate5m', 'unknown'),
+                            'hashrate_1d': worker_stats.get('hashrate1d', 'unknown'),
+                            'pool_shares': worker_stats.get('shares', 0),
+                            'last_pool_share': worker_stats.get('lastshare', 0),
+                            'best_ever': worker_stats.get('bestever', 0)
+                        }, 'SHARE')
         
         # Security status
         if perf_stats['suspicious_events'] > 0:

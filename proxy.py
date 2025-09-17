@@ -229,7 +229,7 @@ def analyze_share_timing(miner_addr, submit_time):
             profile['avg_share_interval'] = statistics.mean(profile['share_submission_times'])
             
             # Check for suspicious patterns
-            if interval < 0.1:  # Less than 100ms between shares
+            if interval < 0.01:  # Less than 100ms between shares
                 log_suspicious_event('share_skimming', 
                                    f"Rapid fire shares: {miner_addr} submitted shares {interval*1000:.1f}ms apart", 
                                    {'miner': miner_addr, 'interval_ms': interval*1000}, 'MEDIUM')
